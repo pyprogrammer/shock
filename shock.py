@@ -7,6 +7,20 @@ from collections import defaultdict
 def _get_distance(klass, parentklass):
     return klass.__mro__.index(parentklass)
 
+def _greatest_common_type(klasses):
+    print(klasses)
+    type_lists = [klass.__mro__[::-1] for klass in klasses]
+    all_classes = set(type_lists[0])
+    for type_list in type_lists[1:]:
+        all_classes.intersection_update(type_list)
+    commons = []
+    for klass in all_classes:
+        order = sum(type_list.index(klass) for type_list in type_lists)
+        commons.append((order, klass))
+    return max(commons)[1]
+
+
+
 def shock(func):
     if not hasattr(shock, 'cache'):
         shock.cache = defaultdict(dict) #shock.cache is a dictionary of func_name:(mapping name,type) tuples to func objects.
@@ -33,7 +47,7 @@ def shock(func):
         for arg in spec.args:
             key.append((arg, spec.annotations.get(arg, object)))
         if spec.varargs:
-            key.append('-varargs',spec.annotations.get(spec.varargs, object))
+            key.append(('-varargs',spec.annotations.get(spec.varargs, object)))
         for kwonlyarg in spec.kwonlyargs:
             key.append((kwonlyarg, spec.annotations.get(kwonlyarg, object)))
         if spec.varkw:
@@ -62,8 +76,18 @@ def shock(func):
         arguments['-kwargs'] = frozenset((key,value) for key,value in arguments['-kwargs'].items())
         key = frozenset((key,value) for key,value in arguments.items())
         type_dict = {}
+        print(arguments)
         for arg in arguments:
-            type_dict[arg] = type(arguments[arg]) if arg not in ('-kwargs','-varargs') else object
+            if not arguments[arg]:
+                type_dict[arg] = object
+                continue
+            if arg == '-kwargs':
+                t = _greatest_common_type([type(e) for key, e in arguments['-kwargs']])
+            elif arg == '-varargs':
+                t = _greatest_common_type([type(e) for e in arguments['-varargs']])
+            else:
+                t = type(arguments[arg])
+            type_dict[arg] = t
         return lookup(func.__name__, type_dict)(*args, **kwargs)
 
     return wrapper
@@ -79,5 +103,7 @@ if __name__ == '__main__':
         print(int, None, int)
         return a,b,c
 
+
     print(f(3,2,4))
     print(f(3,2,'hello'))
+    print(f(3,'hello','world'))
