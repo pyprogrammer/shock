@@ -2,108 +2,133 @@ __author__ = 'nzhang-dev'
 
 import functools
 import inspect
-from collections import defaultdict
-
-def _get_distance(klass, parentklass):
-    return klass.__mro__.index(parentklass)
-
-def _greatest_common_type(klasses):
-    print(klasses)
-    type_lists = [klass.__mro__[::-1] for klass in klasses]
-    all_classes = set(type_lists[0])
-    for type_list in type_lists[1:]:
-        all_classes.intersection_update(type_list)
-    commons = []
-    for klass in all_classes:
-        order = sum(type_list.index(klass) for type_list in type_lists)
-        commons.append((order, klass))
-    return max(commons)[1]
+from collections import defaultdict, namedtuple
 
 
 
-def shock(func):
-    if not hasattr(shock, 'cache'):
-        shock.cache = defaultdict(dict) #shock.cache is a dictionary of func_name:(mapping name,type) tuples to func objects.
-        #I.E. 'hello':{{('x',int),('y',str)}:f}
+class Shock:
+    cache = defaultdict(dict)
+    ParameterKey = namedtuple('ParameterKey', ['name', 'kind', 'type','default'])
 
 
-    def lookup(name, type_dict):
-        '''type_dict is dict of arg_name:arg_type pairs, with object being the default arg_type'''
+    @staticmethod
+    def get_distance(klass, parentklass):
+        if not issubclass(klass, parentklass):
+            raise TypeError('{} is not a subclass of {}'.format(klass, parentklass))
+        return klass.__mro__.index(parentklass)
 
-        results = []
-        for cache_key, func in shock.cache[name].items():
+    @staticmethod
+    def greatest_common_type(klasses):
+        type_lists = [klass.__mro__[::-1] for klass in klasses]
+        all_classes = set(type_lists[0])
+        for type_list in type_lists[1:]:
+            all_classes.intersection_update(type_list)
+        commons = []
+        for klass in all_classes:
+            order = sum(type_list.index(klass) for type_list in type_lists)
+            commons.append((order, klass))
+        return max(commons)[1]
+
+    @classmethod
+    def param_to_key(cls, param):
+        """returns a hashable key for param"""
+        param_type = object
+        if isinstance(param.annotation, type) and not issubclass(param.annotation, inspect.Signature.empty):
+            param_type = param.annotation
+        return cls.ParameterKey(param.name, param.kind, param_type, param.default)
+
+    @classmethod
+    def lookup(cls, name, type_dict):
+        '''returns the cached version of function of name <name> that can process the args and kwargs'''
+        func_cache = cls.cache[name] #the cache that has the versions of function <name>
+        distances = []
+        for signature, func in func_cache.items():
             try:
-                distance = sum(_get_distance(type_dict[arg_name], arg_type) for arg_name, arg_type in cache_key)
-                results.append((distance, func))
-            except ValueError: #the types don't match up
+                distance = 0
+                for arg, arg_type in signature:
+                    distance += cls.get_distance(type_dict[arg], arg_type)
+                distances.append((distance, func))
+            except (ValueError, KeyError):
                 continue
-        if not results:
-            raise TypeError("Function {} with signature {} not found".format(name, type_dict))
-        return min(results)[1]
+        return min(distances)[1]
 
-    def make_key(f):
-        spec = inspect.getfullargspec(f)
-        key = []
-        for arg in spec.args:
-            key.append((arg, spec.annotations.get(arg, object)))
-        if spec.varargs:
-            key.append(('-varargs',spec.annotations.get(spec.varargs, object)))
-        for kwonlyarg in spec.kwonlyargs:
-            key.append((kwonlyarg, spec.annotations.get(kwonlyarg, object)))
-        if spec.varkw:
-            key.append(('-kwargs', spec.annotations.get(spec.varkw, object)))
-        key = frozenset(key)
+
+
+    @classmethod
+    def make_key(cls, f):
+        signature = inspect.signature(f)
+        key = tuple(cls.param_to_key(parameter) for parameter in signature.parameters.values())
         return key
 
-    shock.cache[func.__name__][make_key(func)] = func
+    def __new__(cls, func):
+        key = cls.make_key(func)
+        cache_entry = cls.cache[func.__name__]
+        if cache_entry and key in cache_entry:
+            return cache_entry[key]
 
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        spec = inspect.getfullargspec(func)
-        arguments = {}
-        iter_args = iter(args)
-        for arg_name in spec.args:
-            arguments[arg_name] = next(iter_args)
-        arguments['-varargs'] = tuple(iter_args)
-        arguments['-kwargs'] = {}
-        for arg_name, value in kwargs.items():
-            if arg_name in spec.args:
-                if arg_name in arguments:
-                    raise TypeError("{} got multiple values for argument '{}'".format(func.__name__, arg_name))
-                arguments[arg_name] = value
-            else:
-                arguments['-kwargs'][arg_name] = value
-        arguments['-kwargs'] = frozenset((key,value) for key,value in arguments['-kwargs'].items())
-        key = frozenset((key,value) for key,value in arguments.items())
-        type_dict = {}
-        print(arguments)
-        for arg in arguments:
-            if not arguments[arg]:
-                type_dict[arg] = object
-                continue
-            if arg == '-kwargs':
-                t = _greatest_common_type([type(e) for key, e in arguments['-kwargs']])
-            elif arg == '-varargs':
-                t = _greatest_common_type([type(e) for e in arguments['-varargs']])
-            else:
-                t = type(arguments[arg])
-            type_dict[arg] = t
-        return lookup(func.__name__, type_dict)(*args, **kwargs)
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            min_dist, function = float('inf'), lambda *args, **kwargs: NotImplementedError('Function not defined')
+            for parameter_keys in cache_entry:
+                parameter_list = [inspect.Parameter(param_key.name, param_key.kind, default=param_key.default,
+                                                    annotation=param_key.type) for param_key in parameter_keys]
+                signature = inspect.Signature(parameters=parameter_list)
+                try:
+                    bound = signature.bind(*args, **kwargs)
+                except TypeError:
+                    continue
+                for param in parameter_list:
+                    if param.name not in bound.arguments and param.default != inspect.Signature.empty:
+                        bound.arguments[param.name] = param.default
+                distance = 0
+                best_key = None
+                try:
+                    for param_name, value in bound.arguments.items():
 
-    return wrapper
+                        param_type = signature.parameters[param_name].annotation
+                        if signature.parameters[param_name].kind == inspect.Parameter.VAR_POSITIONAL:
+                            val_type = cls.greatest_common_type(type(arg) for arg in value)
+                        elif signature.parameters[param_name].kind == inspect.Parameter.VAR_KEYWORD:
+                            val_type = cls.greatest_common_type(type(arg) for arg in value.values())
+                        else:
+                            val_type = type(value)
+                        distance += cls.get_distance(val_type, param_type)
+                except TypeError:
+                    #TypeError means not all args were filled or args were not the right type
+                    continue
+                if distance < min_dist:
+                    min_dist, function = distance, cache_entry[parameter_keys]
+            return function(*args, **kwargs)
+        cache_entry[key] = func
+        return wrapper
 
 if __name__ == '__main__':
-    @shock
+    @Shock
     def f(a:int, b, c:str):
         print(int, None, str)
         return a,b,c
 
-    @shock
+    @Shock
     def f(a:int, b, c:int):
         print(int, None, int)
         return a,b,c
 
 
+    @Shock
+    def f(*a:int):
+        print('*args, int')
+        return a
+
+    @Shock
+    def f(*a:str):
+        print('*args, str')
+        return a
+
+
     print(f(3,2,4))
     print(f(3,2,'hello'))
     print(f(3,'hello','world'))
+    print(f(3,3,3,2,3,2))
+    print(f('hello','hello'))
+
+    print(Shock.cache)
